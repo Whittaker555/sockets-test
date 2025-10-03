@@ -1,0 +1,20 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+# AWS Configuration
+aws_region = "us-east-1"
+
+# Project Configuration
+project_name = "socketio-app"
+environment  = "prod"
+
+# EC2 Configuration
+instance_type = "t3.micro"  # Free tier eligible
+app_port     = 3000
+
+# SSH Key (required)
+# Generate with: ssh-keygen -t rsa -b 4096 -C "your_email@example.com"
+# Then copy the content of your public key file (e.g., ~/.ssh/id_rsa.pub)
+public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAA... your-public-key-here"
+
+# Security (optional - restrict SSH access to your IP)
+# allowed_ssh_cidr = "YOUR.IP.ADDRESS.HERE/32"

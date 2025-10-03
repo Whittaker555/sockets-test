@@ -1,0 +1,192 @@
+name: Deploy Socket.IO App to EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - prod
+          - staging
+      terraform_action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.5.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  terraform:
+    name: 'Terraform Infrastructure'
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ip: ${{ steps.terraform.outputs.instance_ip }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: main  # Only deploy from main branch
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Terraform Init
+      working-directory: ./infra
+      run: terraform init
+    
+    - name: Terraform Validate
+      working-directory: ./infra
+      run: terraform validate
+    
+    - name: Terraform Plan
+      working-directory: ./infra
+      run: |
+        terraform plan \
+          -var="aws_region=${{ env.AWS_REGION }}" \
+          -var="environment=${{ github.event.inputs.environment }}" \
+          -var="public_key=${{ secrets.EC2_PUBLIC_KEY }}" \
+          -out=tfplan
+    
+    - name: Terraform Apply
+      if: github.event.inputs.terraform_action == 'apply'
+      working-directory: ./infra
+      run: terraform apply -auto-approve tfplan
+      
+    - name: Terraform Destroy
+      if: github.event.inputs.terraform_action == 'destroy'
+      working-directory: ./infra
+      run: |
+        terraform destroy -auto-approve \
+          -var="aws_region=${{ env.AWS_REGION }}" \
+          -var="environment=${{ github.event.inputs.environment }}" \
+          -var="public_key=${{ secrets.EC2_PUBLIC_KEY }}"
+    
+    - name: Get Terraform Outputs
+      if: github.event.inputs.terraform_action == 'apply'
+      id: terraform
+      working-directory: ./infra
+      run: |
+        INSTANCE_IP=$(terraform output -raw instance_public_ip)
+        echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+        echo "Instance IP: $INSTANCE_IP"
+
+  deploy:
+    name: 'Deploy Application'
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.event.inputs.terraform_action == 'apply'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: main
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: './app/package.json'
+    
+    - name: Install dependencies
+      working-directory: ./app
+      run: |
+        # Update package.json to use 'node' instead of 'nodemon' in production
+        npm install --production
+    
+    - name: Prepare deployment package
+      working-directory: ./app
+      run: |
+        # Create deployment package
+        tar -czf ../socketio-app.tar.gz .
+    
+    - name: Configure SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H ${{ needs.terraform.outputs.instance_ip }} >> ~/.ssh/known_hosts
+    
+    - name: Wait for EC2 instance to be ready
+      run: |
+        echo "Waiting for EC2 instance to be ready..."
+        for i in {1..30}; do
+          if ssh -i ~/.ssh/deploy_key -o ConnectTimeout=10 ec2-user@${{ needs.terraform.outputs.instance_ip }} "echo 'Instance is ready'"; then
+            echo "Instance is ready!"
+            break
+          fi
+          echo "Attempt $i/30: Instance not ready yet, waiting 30 seconds..."
+          sleep 30
+        done
+    
+    - name: Deploy application
+      run: |
+        set -e
+        
+        INSTANCE_IP="${{ needs.terraform.outputs.instance_ip }}"
+        
+        echo "Deploying to EC2 instance: $INSTANCE_IP"
+        
+        # Run deployment script on EC2
+        ssh -i ~/.ssh/deploy_key ec2-user@$INSTANCE_IP "sudo /opt/deploy.sh"
+        
+        # Copy application files
+        scp -i ~/.ssh/deploy_key socketio-app.tar.gz ec2-user@$INSTANCE_IP:/tmp/
+        
+        # Extract and setup application
+        ssh -i ~/.ssh/deploy_key ec2-user@$INSTANCE_IP << 'EOF'
+          set -e
+          
+          # Extract application files
+          cd /opt/socketio-app
+          sudo tar -xzf /tmp/socketio-app.tar.gz
+          
+          # Install dependencies
+          sudo npm install --production
+          
+          # Set proper ownership
+          sudo chown -R ec2-user:ec2-user /opt/socketio-app
+          
+          # Update package.json start script for production
+          sudo sed -i 's/"start": "nodemon index.js"/"start": "node index.js"/' package.json
+          
+          # Start the application
+          sudo systemctl start socketio-app
+          sudo systemctl status socketio-app
+          
+          echo "Application deployed successfully!"
+          echo "Application URL: http://$(curl -s http://checkip.amazonaws.com/):3000"
+        EOF
+        
+        # Clean up
+        rm -f ~/.ssh/deploy_key
+        rm -f socketio-app.tar.gz
+    
+    - name: Deployment Summary
+      run: |
+        echo "🚀 Deployment completed successfully!"
+        echo "📍 Instance IP: ${{ needs.terraform.outputs.instance_ip }}"
+        echo "🌐 Application URL: http://${{ needs.terraform.outputs.instance_ip }}:3000"
+        echo "🔗 Also available via nginx: http://${{ needs.terraform.outputs.instance_ip }}"
